@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: dispatch-dashboard
+    env: node
+    plan: free
+    buildCommand: pnpm install && pnpm run build
+    startCommand: pnpm run preview
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
