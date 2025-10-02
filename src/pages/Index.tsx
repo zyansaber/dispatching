@@ -1,303 +1,296 @@
-// Import the functions you need from the SDKs you need
-import { initializeApp } from "firebase/app";
-import { getDatabase, ref, get, push } from "firebase/database";
-import { ReallocationData, DispatchData, ScheduleData, ProcessedReallocationEntry, ProcessedDispatchEntry } from "@/types";
+import { useState, useEffect, useMemo } from "react";
+import { DispatchTable, ReallocationTable, DispatchStats } from "@/components/DataTables";
+import { ProcessedDispatchEntry, ProcessedReallocationEntry } from "@/types";
+import { 
+  fetchReallocationData, 
+  fetchDispatchData, 
+  fetchScheduleData,
+  processReallocationData,
+  processDispatchData,
+  getDispatchStats,
+  filterDispatchData
+} from "@/lib/firebase";
+import { Loader2 } from "lucide-react";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Input } from "@/components/ui/input";
 
-// Your web app's Firebase configuration
-const firebaseConfig = {
-  apiKey: "AIzaSyBcczqGj5X1_w9aCX1lOK4-kgz49Oi03Bg",
-  authDomain: "scheduling-dd672.firebaseapp.com",
-  databaseURL: "https://scheduling-dd672-default-rtdb.asia-southeast1.firebasedatabase.app",
-  projectId: "scheduling-dd672",
-  storageBucket: "scheduling-dd672.firebasestorage.app",
-  messagingSenderId: "432092773012",
-  appId: "1:432092773012:web:ebc7203ea570b0da2ad281"
-};
-
-
-// --- helper: robust parse for "DD/MM/YYYY, HH:mm[:ss] am/pm" and ISO ---
-const parseSubmitTime = (raw?: string): number => {
-  if (!raw) return -Infinity;
-  const iso = Date.parse(raw);
-  if (!Number.isNaN(iso)) return iso;
-
-  const m = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4}),?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?/i);
-  if (!m) return -Infinity;
-
-  let [, dd, mm, yyyy, hh, min, ss = "0", ap] = m;
-  let H = parseInt(hh, 10);
-  const D = parseInt(dd, 10);
-  const M = parseInt(mm, 10) - 1;
-  const Y = parseInt(yyyy, 10);
-
-  if (ap) {
-    const lower = ap.toLowerCase();
-    if (lower === "pm" && H < 12) H += 12;
-    if (lower === "am" && H === 12) H = 0;
-  }
-
-  const date = new Date(Y, M, D, H, parseInt(min, 10), parseInt(ss, 10));
-  return date.getTime();
-};
-
-
-
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const database = getDatabase(app);
-
-export const fetchReallocationData = async (): Promise<ReallocationData> => {
-  try {
-    const snapshot = await get(ref(database, 'reallocation'));
-    return snapshot.val() || {};
-  } catch (error) {
-    console.error("Error fetching reallocation data:", error);
-    return {};
-  }
-};
-
-export const fetchDispatchData = async (): Promise<DispatchData> => {
-  try {
-    const snapshot = await get(ref(database, 'Dispatch'));
-    return snapshot.val() || {};
-  } catch (error) {
-    console.error("Error fetching dispatch data:", error);
-    return {};
-  }
-};
-
-export const fetchScheduleData = async (): Promise<ScheduleData> => {
-  try {
-    const snapshot = await get(ref(database, 'schedule'));
-    return snapshot.val() || [];
-  } catch (error) {
-    console.error("Error fetching schedule data:", error);
-    return [];
-  }
-};
-
-export const reportError = async (chassisNo: string, errorDetails: string): Promise<boolean> => {
-  try {
-    const errorData = {
-      chassisNo,
-      errorDetails,
-      timestamp: new Date().toISOString(),
-      status: "reported"
-    };
-    await push(ref(database, 'dispatchError'), errorData);
-    return true;
-  } catch (error) {
-    console.error("Error reporting error:", error);
-    return false;
-  }
-};
-
-export const processReallocationData = (
-  reallocationData: ReallocationData,
-  scheduleData: ScheduleData
-): ProcessedReallocationEntry[] => {
-  const processed: ProcessedReallocationEntry[] = [];
-  
-  // 建立 schedule 数据里 chassis → Regent Production 的映射
-  const chassisToRegentProduction = new Map<string, string>();
-  scheduleData.forEach(entry => {
-    chassisToRegentProduction.set(entry.Chassis, entry["Regent Production"]);
+export default function Index() {
+  const [allDispatchData, setAllDispatchData] = useState<ProcessedDispatchEntry[]>([]);
+  const [filteredDispatchData, setFilteredDispatchData] = useState<ProcessedDispatchEntry[]>([]);
+  const [reallocationData, setReallocationData] = useState<ProcessedReallocationEntry[]>([]);
+  const [rawReallocationData, setRawReallocationData] = useState({});
+  const [dispatchStats, setDispatchStats] = useState({ 
+    total: 0, 
+    okStatus: 0, 
+    invalidStock: 0, 
+    snowyStock: 0, 
+    canBeDispatched: 0 
   });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [activeFilter, setActiveFilter] = useState("all");
+  const [globalSearchTerm, setGlobalSearchTerm] = useState("");
 
-  Object.entries(reallocationData).forEach(([chassisNumber, entries]) => {
-    const entryIds = Object.keys(entries);
-    if (entryIds.length === 0) return;
+  const isSnowyStock = (s?: string) => (s ?? "").trim().toLowerCase() === "snowy stock";
 
-    // 👉 挑出该 chassis 最新的一条 reallocation（按 submitTime）
-    const latestEntryId = entryIds.reduce((latest, current) => {
-      const lt = Date.parse(entries[latest].submitTime || '');
-      const ct = Date.parse(entries[current].submitTime || '');
-      return ct > lt ? current : latest;
-    });
+  const loadData = async () => {
+    try {
+      setLoading(true);
+      setError(null);
 
-    const latestEntry = entries[latestEntryId];
+      const [rawReallocation, rawDispatch, rawSchedule] = await Promise.all([
+        fetchReallocationData(),
+        fetchDispatchData(),
+        fetchScheduleData()
+      ]);
 
-    // 如果该 chassis 的 Regent Production = Finished，就跳过
-    const regentProduction = chassisToRegentProduction.get(chassisNumber);
-    if (regentProduction === "Finished") {
+      const processedReallocation = processReallocationData(rawReallocation, rawSchedule);
+      const processedDispatch = processDispatchData(rawDispatch, rawReallocation);
+      const stats = getDispatchStats(rawDispatch, rawReallocation);
+
+      setReallocationData(processedReallocation);
+      setAllDispatchData(processedDispatch);
+      setRawReallocationData(rawReallocation);
+      setDispatchStats(stats);
+
+      const initialFiltered = filterDispatchData(processedDispatch, activeFilter, rawReallocation);
+      setFilteredDispatchData(initialFiltered);
+    } catch (err) {
+      console.error("Error loading data:", err);
+      setError("Failed to load data from Firebase. Please check your connection and try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  const handleFilterChange = (filter: string) => {
+    setActiveFilter(filter);
+    if (filter === "snowyStock") {
+      setFilteredDispatchData(snowyStockList);
+      setGlobalSearchTerm("");
       return;
     }
-
-    processed.push({
-      ...latestEntry,
-      chassisNumber,
-      entryId: latestEntryId,
-      regentProduction: regentProduction || "N/A"
-    });
-  });
-
-  return processed;
-};
-
-export const validateDealerCheck = (
-  sapData: string | undefined,
-  scheduledDealer: string | undefined,
-  reallocatedTo: string | undefined
-): string => {
-  // If all three fields are the same (and not empty), return OK
-  if (sapData && scheduledDealer && reallocatedTo && 
-      sapData === scheduledDealer && scheduledDealer === reallocatedTo) {
-    return "OK";
-  }
-  
-  // If SAP Data and Scheduled Dealer are the same but no reallocation, return OK
-  if (sapData && scheduledDealer && sapData === scheduledDealer && !reallocatedTo) {
-    return "OK";
-  }
-  
-  return "Mismatch";
-};
-
-export const processDispatchData = (
-  dispatchData: DispatchData,
-  reallocationData: ReallocationData
-): ProcessedDispatchEntry[] => {
-  const processed: ProcessedDispatchEntry[] = [];
-  
-  // Create a map of chassis to reallocatedTo from reallocation data
-  const chassisToReallocatedTo = new Map<string, string>();
-  Object.entries(reallocationData).forEach(([chassisNumber, entries]) => {
-    const entryIds = Object.keys(entries);
-    if (entryIds.length > 0) {
-      // Get the latest entry
-      const latestEntryId = entryIds.reduce((latest, current) => {
-  const lt = parseSubmitTime(entries[latest].submitTime);
-  const ct = parseSubmitTime(entries[current].submitTime);
-  return ct > lt ? current : latest;
-});
-      chassisToReallocatedTo.set(chassisNumber, entries[latestEntryId].reallocatedTo);
+    if (filter === "canBeDispatched") {
+      setFilteredDispatchData(canBeDispatchedList);
+      setGlobalSearchTerm("");
+      return;
     }
-  });
-
-  Object.entries(dispatchData).forEach(([chassisNo, entry]) => {
-    const reallocatedTo = chassisToReallocatedTo.get(chassisNo);
-    
-    // Validate dealer check based on three-way comparison
-    const validatedDealerCheck = validateDealerCheck(
-      entry["SAP Data"],
-      entry["Scheduled Dealer"],
-      reallocatedTo
-    );
-    
-    processed.push({
-      ...entry,
-      DealerCheck: validatedDealerCheck,
-      ...(reallocatedTo && { reallocatedTo })
-    });
-  });
-
-  return processed;
-};
-
-const isSnowyStock = (entry: ProcessedDispatchEntry, chassisToReallocatedTo: Map<string, string>) => {
-  const reallocatedTo = chassisToReallocatedTo.get(entry["Chassis No"]);
-  if ((reallocatedTo ?? "").trim() === "Snowy Stock") return true;
-  const scheduledDealer = (entry as any)["Scheduled Dealer"] ?? (entry as any).regentProduction ?? "";
-  return (scheduledDealer ?? "").trim() === "Snowy Stock" && ((reallocatedTo ?? "").trim() === "");
-};
-
-export const getDispatchStats = (dispatchData: DispatchData, reallocationData: ReallocationData) => {
-  const entries = Object.values(dispatchData);
-  const total = entries.length;
-  const okStatus = entries.filter(entry => entry.Statuscheck === "OK").length;
-  const invalidStock = entries.filter(entry => entry.Statuscheck !== "OK").length;
-  
-  // Create a map of chassis to reallocatedTo from reallocation data
-  const chassisToReallocatedTo = new Map<string, string>();
-  Object.entries(reallocationData).forEach(([chassisNumber, entryObj]) => {
-    const entryIds = Object.keys(entryObj);
-    if (entryIds.length > 0) {
-      const latestEntryId = entryIds.reduce((latest, current) => {
-  const lt = parseSubmitTime(entryObj[latest].submitTime);
-  const ct = parseSubmitTime(entryObj[current].submitTime);
-  return ct > lt ? current : latest;
-});
-      chassisToReallocatedTo.set(chassisNumber, entryObj[latestEntryId].reallocatedTo);
-    }
-  });
-
-  // Process entries with validated dealer check
-  const processedEntries = entries.map(entry => {
-    const reallocatedTo = chassisToReallocatedTo.get(entry["Chassis No"]);
-    const validatedDealerCheck = validateDealerCheck(
-      entry["SAP Data"],
-      entry["Scheduled Dealer"],
-      reallocatedTo
-    );
-    return { ...entry, DealerCheck: validatedDealerCheck, reallocatedTo };
-  });
-
-  // Calculate Snowy Stock
-  const snowyStock = processedEntries.filter(entry => isSnowyStock(entry, chassisToReallocatedTo)).length;
-  
-  // Calculate Can be Dispatched: Status Check OK but excluding Snowy Stock
-  const canBeDispatched = processedEntries.filter(entry => 
-    entry.Statuscheck === "OK" && !isSnowyStock(entry, chassisToReallocatedTo)
-  ).length;
-  
-  return {
-    total,
-    okStatus,
-    invalidStock,
-    snowyStock,
-    canBeDispatched
+    const filtered = filterDispatchData(allDispatchData, filter, rawReallocationData);
+    setFilteredDispatchData(filtered);
+    setGlobalSearchTerm("");
   };
-};
 
-export const filterDispatchData = (
-  data: ProcessedDispatchEntry[],
-  filter: string,
-  reallocationData: ReallocationData
-): ProcessedDispatchEntry[] => {
-  if (filter === 'all') return data;
-  
-  if (filter === 'ok') {
-    return data.filter(entry => entry.Statuscheck === "OK");
-  }
-  
-  if (filter === 'invalid') {
-    return data.filter(entry => entry.Statuscheck !== "OK");
-  }
-  
-  // Create a map of chassis to reallocatedTo from reallocation data
-  const chassisToReallocatedTo = new Map<string, string>();
-  Object.entries(reallocationData).forEach(([chassisNumber, entryObj]) => {
-    const entryIds = Object.keys(entryObj);
-    if (entryIds.length > 0) {
-      const latestEntryId = entryIds.reduce((latest, current) => {
-  const lt = parseSubmitTime(entryObj[latest].submitTime);
-  const ct = parseSubmitTime(entryObj[current].submitTime);
-  return ct > lt ? current : latest;
-});
-      chassisToReallocatedTo.set(chassisNumber, entryObj[latestEntryId].reallocatedTo);
-    }
-  });
+  const handleGlobalSearchChange = (term: string) => {
+    setGlobalSearchTerm(term);
+  };
 
-  if (filter === 'snowy') {
-    return data.filter(entry => isSnowyStock(entry, chassisToReallocatedTo));
-  }
-  
-  if (filter === 'canBeDispatched') {
-    return data.filter(entry => 
-      entry.Statuscheck === "OK" && !isSnowyStock(entry, chassisToReallocatedTo)
+  const handleRefresh = () => {
+    loadData();
+  };
+
+  const reallocationByChassis = useMemo(() => {
+    return new Map(reallocationData.map(r => [r.chassisNumber, r]));
+  }, [reallocationData]);
+
+  const snowyStockList = useMemo(() => {
+    return allDispatchData.filter(d => {
+      const latest = reallocationByChassis.get(d["Chassis No"]);
+      const latestTo = (latest?.reallocatedTo ?? "").trim();
+      const scheduledDealer = (d as any)["Scheduled Dealer"] ?? (d as any).regentProduction ?? "";
+      return (isSnowyStock(latestTo) || (isSnowyStock(scheduledDealer) && latestTo === ""));
+    });
+  }, [allDispatchData, reallocationByChassis]);
+
+  const canBeDispatchedList = useMemo(() => {
+    return allDispatchData.filter(d => {
+      const statusOk = String((d as any).Statuscheck ?? (d as any).status ?? "").toUpperCase() === "OK";
+      const latest = reallocationByChassis.get(d["Chassis No"]);
+      const latestTo = (latest?.reallocatedTo ?? "").trim();
+      const scheduledDealer = (d as any)["Scheduled Dealer"] ?? (d as any).regentProduction ?? "";
+      const inSnowy = isSnowyStock(latestTo) || (isSnowyStock(scheduledDealer) && latestTo === "");
+      return statusOk && !inSnowy;
+    });
+  }, [allDispatchData, reallocationByChassis]);
+
+  const displayStats = {
+    ...dispatchStats,
+    snowyStock: snowyStockList.length,
+    canBeDispatched: canBeDispatchedList.length
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="flex items-center space-x-2">
+          <Loader2 className="h-6 w-6 animate-spin" />
+          <span>Loading data from Firebase...</span>
+        </div>
+      </div>
     );
   }
-  
-  return data;
-};
 
-export const getGRDaysColor = (days: number): string => {
-  if (days <= 7) return "bg-green-500"; // Green for 0-7 days
-  if (days <= 14) return "bg-yellow-500"; // Yellow for 8-14 days
-  if (days <= 30) return "bg-orange-500"; // Orange for 15-30 days
-  return "bg-red-500"; // Red for 30+ days
-};
+  if (error) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-6">
+        <Alert className="max-w-md">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      </div>
+    );
+  }
 
-export const getGRDaysWidth = (days: number, maxDays: number): number => {
-  return Math.min((days / Math.max(maxDays, 1)) * 100, 100);
-};
+  const safeStringIncludes = (value: any, searchTerm: string): boolean => {
+    if (value === null || value === undefined) return false;
+    return String(value).toLowerCase().includes(searchTerm);
+  };
+
+  const getSearchResultCounts = () => {
+    if (!globalSearchTerm) {
+      return {
+        dispatchCount:
+          activeFilter === "snowyStock"
+            ? snowyStockList.length
+            : activeFilter === "canBeDispatched"
+            ? canBeDispatchedList.length
+            : filteredDispatchData.length,
+        reallocationCount: reallocationData.length
+      };
+    }
+    const searchLower = globalSearchTerm.toLowerCase();
+    const baseDispatch =
+      activeFilter === "snowyStock"
+        ? snowyStockList
+        : activeFilter === "canBeDispatched"
+        ? canBeDispatchedList
+        : filteredDispatchData;
+    const dispatchMatches = baseDispatch.filter(entry => {
+      const dispatchMatch = (
+        safeStringIncludes(entry["Chassis No"], searchLower) ||
+        safeStringIncludes(entry.Customer, searchLower) ||
+        safeStringIncludes(entry.Model, searchLower) ||
+        safeStringIncludes(entry["Matched PO No"], searchLower) ||
+        safeStringIncludes(entry["SAP Data"], searchLower) ||
+        safeStringIncludes(entry["Scheduled Dealer"], searchLower) ||
+        safeStringIncludes(entry.Statuscheck, searchLower) ||
+        safeStringIncludes(entry.DealerCheck, searchLower) ||
+        safeStringIncludes((entry as any).reallocatedTo, searchLower)
+      );
+      const reallocationMatch = reallocationData.some(reallocationEntry => 
+        reallocationEntry.chassisNumber === entry["Chassis No"] && (
+          safeStringIncludes(reallocationEntry.chassisNumber, searchLower) ||
+          safeStringIncludes(reallocationEntry.customer, searchLower) ||
+          safeStringIncludes(reallocationEntry.model, searchLower) ||
+          safeStringIncludes(reallocationEntry.originalDealer, searchLower) ||
+          safeStringIncludes(reallocationEntry.reallocatedTo, searchLower) ||
+          safeStringIncludes(reallocationEntry.regentProduction, searchLower) ||
+          safeStringIncludes(reallocationEntry.issue?.type, searchLower)
+        )
+      );
+      return dispatchMatch || reallocationMatch;
+    });
+    const reallocationMatches = reallocationData.filter(entry => {
+      const reallocationMatch = (
+        safeStringIncludes(entry.chassisNumber, searchLower) ||
+        safeStringIncludes(entry.customer, searchLower) ||
+        safeStringIncludes(entry.model, searchLower) ||
+        safeStringIncludes(entry.originalDealer, searchLower) ||
+        safeStringIncludes(entry.reallocatedTo, searchLower) ||
+        safeStringIncludes(entry.regentProduction, searchLower) ||
+        safeStringIncludes(entry.issue?.type, searchLower)
+      );
+      const dispatchMatch = allDispatchData.some(dispatchEntry => 
+        dispatchEntry["Chassis No"] === entry.chassisNumber && (
+          safeStringIncludes(dispatchEntry["Chassis No"], searchLower) ||
+          safeStringIncludes(dispatchEntry.Customer, searchLower) ||
+          safeStringIncludes(dispatchEntry.Model, searchLower) ||
+          safeStringIncludes(dispatchEntry["Matched PO No"], searchLower) ||
+          safeStringIncludes(dispatchEntry["SAP Data"], searchLower) ||
+          safeStringIncludes(dispatchEntry["Scheduled Dealer"], searchLower) ||
+          safeStringIncludes(dispatchEntry.Statuscheck, searchLower) ||
+          safeStringIncludes(dispatchEntry.DealerCheck, searchLower) ||
+          safeStringIncludes((dispatchEntry as any).reallocatedTo, searchLower)
+        )
+      );
+      return reallocationMatch || dispatchMatch;
+    });
+    return {
+      dispatchCount: dispatchMatches.length,
+      reallocationCount: reallocationMatches.length
+    };
+  };
+
+  const { dispatchCount, reallocationCount } = getSearchResultCounts();
+
+  const tableData =
+    activeFilter === "snowyStock"
+      ? snowyStockList
+      : activeFilter === "canBeDispatched"
+      ? canBeDispatchedList
+      : filteredDispatchData;
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <div className="container mx-auto px-4 py-6 max-w-7xl">
+        <div className="space-y-6">
+          <div className="text-center">
+            <h1 className="text-2xl md:text-3xl font-bold text-gray-900 mb-2">
+              Dispatch Dashboard
+            </h1>
+          </div>
+          <div className="flex justify-center">
+            <div className="w-full max-w-md">
+              <Input
+                placeholder="Search across all data..."
+                value={globalSearchTerm}
+                onChange={(e) => handleGlobalSearchChange(e.target.value)}
+                className="w-full"
+              />
+            </div>
+          </div>
+          <ReallocationTable 
+            data={reallocationData} 
+            searchTerm={globalSearchTerm}
+            onSearchChange={handleGlobalSearchChange}
+            dispatchData={allDispatchData}
+          />
+          <div className="space-y-4">
+            <h2 className="text-xl md:text-2xl font-bold text-gray-900">Dispatch Data</h2>
+            <DispatchStats 
+              total={dispatchStats.total}
+              invalidStock={dispatchStats.invalidStock}
+              snowyStock={displayStats.snowyStock}
+              canBeDispatched={displayStats.canBeDispatched}
+              onFilterChange={handleFilterChange}
+              activeFilter={activeFilter}
+              onRefresh={handleRefresh}
+            />
+            <DispatchTable 
+              data={tableData}
+              searchTerm={globalSearchTerm}
+              onSearchChange={handleGlobalSearchChange}
+              filter={activeFilter}
+              allData={allDispatchData}
+              reallocationData={reallocationData}
+            />
+          </div>
+          <div className="text-center text-sm text-gray-500 bg-white p-4 rounded-lg">
+            <p>
+              Showing: Reallocation entries: {reallocationCount} | 
+              Dispatch entries: {dispatchCount} | 
+              Total dispatch entries: {dispatchStats.total}
+              {globalSearchTerm && (
+                <span className="text-blue-600 ml-2">
+                  (Filtered by: "{globalSearchTerm}")
+                </span>
+              )}
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
