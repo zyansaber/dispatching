@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { DispatchTable, ReallocationTable, DispatchStats } from "@/components/DataTables";
 import { ProcessedDispatchEntry, ProcessedReallocationEntry } from "@/types";
 import { 
@@ -28,22 +28,22 @@ export default function Index() {
   });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [activeFilter, setActiveFilter] = useState('all');
-  const [globalSearchTerm, setGlobalSearchTerm] = useState('');
+  const [activeFilter, setActiveFilter] = useState("all");
+  const [globalSearchTerm, setGlobalSearchTerm] = useState("");
+
+  const isSnowyStock = (s?: string) => (s ?? "").trim().toLowerCase() === "snowy stock";
 
   const loadData = async () => {
     try {
       setLoading(true);
       setError(null);
 
-      // Fetch all data from Firebase
       const [rawReallocation, rawDispatch, rawSchedule] = await Promise.all([
         fetchReallocationData(),
         fetchDispatchData(),
         fetchScheduleData()
       ]);
 
-      // Process the data according to requirements
       const processedReallocation = processReallocationData(rawReallocation, rawSchedule);
       const processedDispatch = processDispatchData(rawDispatch, rawReallocation);
       const stats = getDispatchStats(rawDispatch, rawReallocation);
@@ -52,8 +52,7 @@ export default function Index() {
       setAllDispatchData(processedDispatch);
       setRawReallocationData(rawReallocation);
       setDispatchStats(stats);
-      
-      // Set initial filtered data
+
       const initialFiltered = filterDispatchData(processedDispatch, activeFilter, rawReallocation);
       setFilteredDispatchData(initialFiltered);
     } catch (err) {
@@ -70,9 +69,19 @@ export default function Index() {
 
   const handleFilterChange = (filter: string) => {
     setActiveFilter(filter);
+    if (filter === "snowyStock") {
+      setFilteredDispatchData(snowyStockList);
+      setGlobalSearchTerm("");
+      return;
+    }
+    if (filter === "canBeDispatched") {
+      setFilteredDispatchData(canBeDispatchedList);
+      setGlobalSearchTerm("");
+      return;
+    }
     const filtered = filterDispatchData(allDispatchData, filter, rawReallocationData);
     setFilteredDispatchData(filtered);
-    setGlobalSearchTerm(''); // Clear search when changing filter
+    setGlobalSearchTerm("");
   };
 
   const handleGlobalSearchChange = (term: string) => {
@@ -81,6 +90,36 @@ export default function Index() {
 
   const handleRefresh = () => {
     loadData();
+  };
+
+  const reallocationByChassis = useMemo(() => {
+    return new Map(reallocationData.map(r => [r.chassisNumber, r]));
+  }, [reallocationData]);
+
+  const snowyStockList = useMemo(() => {
+    return allDispatchData.filter(d => {
+      const latest = reallocationByChassis.get(d["Chassis No"]);
+      const latestTo = (latest?.reallocatedTo ?? "").trim();
+      const scheduledDealer = (d as any)["Scheduled Dealer"] ?? (d as any).regentProduction ?? "";
+      return (isSnowyStock(latestTo) || (isSnowyStock(scheduledDealer) && latestTo === ""));
+    });
+  }, [allDispatchData, reallocationByChassis]);
+
+  const canBeDispatchedList = useMemo(() => {
+    return allDispatchData.filter(d => {
+      const statusOk = String((d as any).Statuscheck ?? (d as any).status ?? "").toUpperCase() === "OK";
+      const latest = reallocationByChassis.get(d["Chassis No"]);
+      const latestTo = (latest?.reallocatedTo ?? "").trim();
+      const scheduledDealer = (d as any)["Scheduled Dealer"] ?? (d as any).regentProduction ?? "";
+      const inSnowy = isSnowyStock(latestTo) || (isSnowyStock(scheduledDealer) && latestTo === "");
+      return statusOk && !inSnowy;
+    });
+  }, [allDispatchData, reallocationByChassis]);
+
+  const displayStats = {
+    ...dispatchStats,
+    snowyStock: snowyStockList.length,
+    canBeDispatched: canBeDispatchedList.length
   };
 
   if (loading) {
@@ -109,18 +148,26 @@ export default function Index() {
     return String(value).toLowerCase().includes(searchTerm);
   };
 
-  // Calculate search result counts with safe string handling
   const getSearchResultCounts = () => {
     if (!globalSearchTerm) {
       return {
-        dispatchCount: filteredDispatchData.length,
+        dispatchCount:
+          activeFilter === "snowyStock"
+            ? snowyStockList.length
+            : activeFilter === "canBeDispatched"
+            ? canBeDispatchedList.length
+            : filteredDispatchData.length,
         reallocationCount: reallocationData.length
       };
     }
-
     const searchLower = globalSearchTerm.toLowerCase();
-    
-    const dispatchMatches = allDispatchData.filter(entry => {
+    const baseDispatch =
+      activeFilter === "snowyStock"
+        ? snowyStockList
+        : activeFilter === "canBeDispatched"
+        ? canBeDispatchedList
+        : filteredDispatchData;
+    const dispatchMatches = baseDispatch.filter(entry => {
       const dispatchMatch = (
         safeStringIncludes(entry["Chassis No"], searchLower) ||
         safeStringIncludes(entry.Customer, searchLower) ||
@@ -130,9 +177,8 @@ export default function Index() {
         safeStringIncludes(entry["Scheduled Dealer"], searchLower) ||
         safeStringIncludes(entry.Statuscheck, searchLower) ||
         safeStringIncludes(entry.DealerCheck, searchLower) ||
-        safeStringIncludes(entry.reallocatedTo, searchLower)
+        safeStringIncludes((entry as any).reallocatedTo, searchLower)
       );
-      
       const reallocationMatch = reallocationData.some(reallocationEntry => 
         reallocationEntry.chassisNumber === entry["Chassis No"] && (
           safeStringIncludes(reallocationEntry.chassisNumber, searchLower) ||
@@ -144,10 +190,8 @@ export default function Index() {
           safeStringIncludes(reallocationEntry.issue?.type, searchLower)
         )
       );
-      
       return dispatchMatch || reallocationMatch;
     });
-
     const reallocationMatches = reallocationData.filter(entry => {
       const reallocationMatch = (
         safeStringIncludes(entry.chassisNumber, searchLower) ||
@@ -158,7 +202,6 @@ export default function Index() {
         safeStringIncludes(entry.regentProduction, searchLower) ||
         safeStringIncludes(entry.issue?.type, searchLower)
       );
-      
       const dispatchMatch = allDispatchData.some(dispatchEntry => 
         dispatchEntry["Chassis No"] === entry.chassisNumber && (
           safeStringIncludes(dispatchEntry["Chassis No"], searchLower) ||
@@ -169,13 +212,11 @@ export default function Index() {
           safeStringIncludes(dispatchEntry["Scheduled Dealer"], searchLower) ||
           safeStringIncludes(dispatchEntry.Statuscheck, searchLower) ||
           safeStringIncludes(dispatchEntry.DealerCheck, searchLower) ||
-          safeStringIncludes(dispatchEntry.reallocatedTo, searchLower)
+          safeStringIncludes((dispatchEntry as any).reallocatedTo, searchLower)
         )
       );
-      
       return reallocationMatch || dispatchMatch;
     });
-
     return {
       dispatchCount: dispatchMatches.length,
       reallocationCount: reallocationMatches.length
@@ -183,6 +224,13 @@ export default function Index() {
   };
 
   const { dispatchCount, reallocationCount } = getSearchResultCounts();
+
+  const tableData =
+    activeFilter === "snowyStock"
+      ? snowyStockList
+      : activeFilter === "canBeDispatched"
+      ? canBeDispatchedList
+      : filteredDispatchData;
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -193,8 +241,6 @@ export default function Index() {
               Dispatch Dashboard
             </h1>
           </div>
-
-          {/* Global Search */}
           <div className="flex justify-center">
             <div className="w-full max-w-md">
               <Input
@@ -205,33 +251,25 @@ export default function Index() {
               />
             </div>
           </div>
-
-          {/* Reallocation Data - First Section (Collapsible) */}
           <ReallocationTable 
             data={reallocationData} 
             searchTerm={globalSearchTerm}
             onSearchChange={handleGlobalSearchChange}
             dispatchData={allDispatchData}
           />
-
-          {/* Dispatch Data Section */}
           <div className="space-y-4">
             <h2 className="text-xl md:text-2xl font-bold text-gray-900">Dispatch Data</h2>
-            
-            {/* Statistics Cards */}
             <DispatchStats 
               total={dispatchStats.total}
               invalidStock={dispatchStats.invalidStock}
-              snowyStock={dispatchStats.snowyStock}
-              canBeDispatched={dispatchStats.canBeDispatched}
+              snowyStock={displayStats.snowyStock}
+              canBeDispatched={displayStats.canBeDispatched}
               onFilterChange={handleFilterChange}
               activeFilter={activeFilter}
               onRefresh={handleRefresh}
             />
-
-            {/* Dispatch Table */}
             <DispatchTable 
-              data={filteredDispatchData}
+              data={tableData}
               searchTerm={globalSearchTerm}
               onSearchChange={handleGlobalSearchChange}
               filter={activeFilter}
@@ -239,8 +277,6 @@ export default function Index() {
               reallocationData={reallocationData}
             />
           </div>
-
-          {/* Summary */}
           <div className="text-center text-sm text-gray-500 bg-white p-4 rounded-lg">
             <p>
               Showing: Reallocation entries: {reallocationCount} | 
